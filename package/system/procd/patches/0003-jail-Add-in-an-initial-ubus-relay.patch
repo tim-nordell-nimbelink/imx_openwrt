@@ -1,0 +1,721 @@
+From 5f3f5a51f4cf3e90eb55356efca98f8bba3e38d1 Mon Sep 17 00:00:00 2001
+From: Tim Nordell <tnordell@airgain.com>
+Date: Wed, 11 Mar 2026 22:18:11 -0500
+Subject: [PATCH 3/7] jail: Add in an initial ubus relay
+
+This relay is the bare minimum to move data and does not filter calls
+(yet). Currently this relay will survive "ubusd" being restarted by
+closing out the session entirely on both sides.
+
+The intention with this patch series is to add in ubus support into
+jails where the process is still running as root, but drops as many
+privileges as possible without having a gaping hole into being able to
+run any command in ubus.  This will work by filtering the ubus calls
+against the ACLs that rpcd maintains for all processes within the jail
+when this relay is enabled.
+
+This adds in a new "ubus_rpc" parameter for service instances.  Users
+who wish to utilize this will also need to modify procd.sh to support
+passing in this argument:
+
+    | --- a/package/system/procd/files/procd.sh
+    | +++ b/package/system/procd/files/procd.sh
+    | @@ -191,6 +191,7 @@ _procd_add_jail() {
+    |                 case $a in
+    |                 log)    json_add_boolean "log" "1";;
+    |                 ubus)   json_add_boolean "ubus" "1";;
+    | +               ubus_rpc)       json_add_boolean "ubus_rpc" "1";;
+    |                 procfs) json_add_boolean "procfs" "1";;
+    |                 sysfs)  json_add_boolean "sysfs" "1";;
+    |                 ronly)  json_add_boolean "ronly" "1";;
+
+Once added in, then you can configure modify uhttpd's init script to
+add in jail parameters into /etc/init.d/uhttpd's start_instance()
+method:
+
+      procd_set_param no_new_privs 1
+      procd_set_param seccomp /etc/seccomp/uhttpd.json
+      procd_set_param capabilities /etc/capabilities/uhttpd.json
+      procd_add_jail uhttpd ubus_rpc ronly
+      procd_add_jail_mount /bin
+      procd_add_jail_mount /sbin
+      procd_add_jail_mount /etc
+      procd_add_jail_mount /lib
+      procd_add_jail_mount /usr
+      procd_add_jail_mount /www
+
+      procd_close_instance
+
+Which would give it broad permissions to access necessary files in a
+read-only fashion on the system. The permitted capabilities should be
+small:
+
+      {
+              "bounding": [
+                      "CAP_NET_BIND_SERVICE",
+                      "CAP_SYS_ADMIN",
+              ],
+              "effective": [
+                      "CAP_NET_BIND_SERVICE",
+                      "CAP_SYS_ADMIN",
+              ],
+              "ambient": [
+                      "CAP_NET_BIND_SERVICE",
+                      "CAP_SYS_ADMIN",
+              ],
+              "permitted": [
+                      "CAP_NET_BIND_SERVICE",
+                      "CAP_SYS_ADMIN",
+              ],
+              "inheritable": [
+                      "CAP_NET_BIND_SERVICE",
+                      "CAP_SYS_ADMIN",
+              ]
+      }
+
+so that it can only bind the network ports it requires. It's useful
+if the seccomp permissions have this at the front:
+
+    "defaultAction": "SCMP_ACT_ERRNO",
+    "defaultErrnoRet": 1,
+
+so that seccomp errors aren't fatal, but do block the syscall. This
+is more akin to how a container is setup normally.
+---
+ CMakeLists.txt     |   2 +-
+ jail/jail.c        |  33 +++-
+ jail/ubus.c        | 415 +++++++++++++++++++++++++++++++++++++++++++++
+ jail/ubus.h        |  21 +++
+ service/instance.c |   9 +
+ service/instance.h |   1 +
+ 6 files changed, 477 insertions(+), 4 deletions(-)
+ create mode 100644 jail/ubus.c
+ create mode 100644 jail/ubus.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 488c555..1934170 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -108,7 +108,7 @@ SET(SOURCES_OCI_SECCOMP jail/seccomp-oci.c)
+ ENDIF()
+ 
+ IF(JAIL_SUPPORT)
+-ADD_EXECUTABLE(ujail jail/jail.c jail/cgroups.c jail/cgroups-bpf.c jail/elf.c jail/fs.c jail/capabilities.c jail/netifd.c ${SOURCES_OCI_SECCOMP})
++ADD_EXECUTABLE(ujail jail/jail.c jail/cgroups.c jail/cgroups-bpf.c jail/elf.c jail/fs.c jail/capabilities.c jail/netifd.c jail/ubus.c ${SOURCES_OCI_SECCOMP})
+ TARGET_LINK_LIBRARIES(ujail ${ubox} ${ubus} ${uci} ${blobmsg_json})
+ INSTALL(TARGETS ujail
+ 	RUNTIME DESTINATION ${CMAKE_INSTALL_SBINDIR}
+diff --git a/jail/jail.c b/jail/jail.c
+index eaec590..0dc5357 100644
+--- a/jail/jail.c
++++ b/jail/jail.c
+@@ -55,6 +55,7 @@
+ #include "seccomp-oci.h"
+ #include "cgroups.h"
+ #include "netifd.h"
++#include "ubus.h"
+ 
+ #include <libubox/blobmsg.h>
+ #include <libubox/blobmsg_json.h>
+@@ -69,10 +70,13 @@
+ #endif
+ 
+ #define STACK_SIZE	(1024 * 1024)
+-#define OPT_ARGS	"cC:d:e:EfFG:h:ij:J:ln:NoO:pP:r:R:sS:uU:w:t:T:y"
++#define OPT_ARGS	"cC:d:e:EfFG:h:ij:J:ln:NoO:pP:r:R:sS:uU:w:t:T:yZ"
+ 
+ #define OCI_VERSION_STRING "1.0.2"
+ 
++static const char ubus_folder[] = "/var/run/ubus/";
++static const char ubus_sock[] = "/var/run/ubus/ubus.sock";
++
+ struct hook_execvpe {
+ 	char *file;
+ 	char **argv;
+@@ -154,6 +158,8 @@ static struct {
+ 	bool immediately;
+ 	struct blob_attr *annotations;
+ 	int term_timeout;
++	bool ubus;
++	bool ubus_rpc_relay;
+ } opts;
+ 
+ static struct blob_buf ocibuf;
+@@ -1016,6 +1022,7 @@ static void usage(void)
+ 	fprintf(stderr, "  -s\t\tjail has /sys\n");
+ 	fprintf(stderr, "  -l\t\tjail has /dev/log\n");
+ 	fprintf(stderr, "  -u\t\tjail has a ubus socket\n");
++	fprintf(stderr, "  -Z\t\tjail has a ubus relay filtered by RPC ACLs\n");
+ 	fprintf(stderr, "  -U <name>\tuser to run jailed process\n");
+ 	fprintf(stderr, "  -G <name>\tgroup to run jailed process\n");
+ 	fprintf(stderr, "  -o\t\tremont jail root (/) read only\n");
+@@ -1257,6 +1264,9 @@ static void post_jail_fs(void)
+ 	if (opts.ronly)
+ 		mount(NULL, "/", "bind", MS_REMOUNT | MS_BIND | MS_RDONLY, 0);
+ 
++	if (opts.ubus_rpc_relay)
++		mount(NULL, "/var/run/ubus", "bind", MS_REMOUNT | MS_BIND | MS_RDONLY, 0);
++
+ 	if (buf[0] != '!') {
+ 		ERROR("parent had an error, child exiting\n");
+ 		free_and_exit(EXIT_FAILURE);
+@@ -2597,7 +2607,6 @@ int main(int argc, char **argv)
+ {
+ 	uid_t uid = getuid();
+ 	const char log[] = "/dev/log";
+-	const char ubus[] = "/var/run/ubus/ubus.sock";
+ 	int ret = EXIT_FAILURE;
+ 	int ch;
+ 	char *tmp;
+@@ -2707,7 +2716,11 @@ int main(int argc, char **argv)
+ 			break;
+ 		case 'u':
+ 			opts.namespace |= CLONE_NEWNS;
+-			add_mount_bind(ubus, 0, -1);
++			opts.ubus = true;
++			break;
++		case 'Z':
++			opts.namespace |= CLONE_NEWNS;
++			opts.ubus_rpc_relay = true;
+ 			break;
+ 		case 'l':
+ 			opts.namespace |= CLONE_NEWNS;
+@@ -2746,6 +2759,9 @@ int main(int argc, char **argv)
+ 		}
+ 	}
+ 
++	if (opts.ubus && opts.ubus_rpc_relay)
++		opts.ubus = false;
++
+ 	if (opts.namespace && !opts.ocibundle)
+ 		opts.namespace |= CLONE_NEWIPC | CLONE_NEWPID;
+ 
+@@ -2974,6 +2990,12 @@ static void post_main(struct uloop_timeout *t)
+ 			add_mount(NULL, "/dev", "tmpfs", MS_NOATIME | MS_NOEXEC | MS_NOSUID, 0, "size=1M", -1);
+ 			add_mount(NULL, "/dev/pts", "devpts", MS_NOATIME | MS_NOEXEC | MS_NOSUID, 0, "newinstance,ptmxmode=0666,mode=0620,gid=5", 0);
+ 
++			if (opts.ubus)
++				add_mount_bind(ubus_sock, 0, -1);
++
++			if (opts.ubus_rpc_relay)
++				add_mount(NULL, ubus_folder, "tmpfs", MS_NOATIME | MS_NOEXEC | MS_NOSUID, 0, "size=1M", -1);
++
+ 			if (opts.procfs || opts.ocibundle) {
+ 				add_mount("proc", "/proc", "proc", MS_NOATIME | MS_NODEV | MS_NOEXEC | MS_NOSUID, 0, NULL, -1);
+ 
+@@ -3143,6 +3165,11 @@ static void post_create_runtime(void)
+ 	}
+ 	close(pipes[0]);
+ 
++	if (opts.ubus_rpc_relay && !ubus_create_relay(jail_process.pid)) {
++		ERROR("Unable to create ubus relay\n");
++		free_and_exit(-1);
++	}
++
+ 	if (opts.ocibundle && !opts.immediately)
+ 		uloop_run(); /* wait for 'start' command via ubus */
+ 	else
+diff --git a/jail/ubus.c b/jail/ubus.c
+new file mode 100644
+index 0000000..687b0dc
+--- /dev/null
++++ b/jail/ubus.c
+@@ -0,0 +1,415 @@
++/*
++ * Copyright (C) 2026 Tim Nordell <tnordell@airgain.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License version 2.1
++ * as published by the Free Software Foundation
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#define _GNU_SOURCE
++
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <sys/un.h>
++#include <string.h>
++#include <syslog.h>
++#include <linux/limits.h>
++
++#include <libubox/blobmsg_json.h>
++#include <libubox/usock.h>
++#include <libubus.h>
++#include <libubox/uloop.h>
++#include <ubusmsg.h>
++
++#include "ubus.h"
++#include "log.h"
++
++static const char UBUS_UNIX_SOCKET[] = "/var/run/ubus/ubus.sock";
++
++struct ubus_relay_server {
++	struct uloop_fd fd;
++};
++
++struct ubus_forward_fd_ctx
++{
++	/* Structure watching for incoming data from ubus socket */
++	struct uloop_fd fd;
++
++	/* Holds ubus message header portion of an incoming message */
++	struct ubus_msghdr msg_hdr;
++
++	/* Holds the blob portion of an incoming message */
++	struct blob_buf msg_data;
++
++	/* If >=0, this contains a file descriptor passed via message */
++	int msg_fd;
++
++	/* How much data we've received so far */
++	int rx_offset;
++
++	/* How much data we've sent so far */
++	int tx_offset;
++};
++
++struct ubus_forward_ctx
++{
++	struct ubus_relay_server *relay;
++	struct ubus_forward_fd_ctx jail;
++	struct ubus_forward_fd_ctx ubus;
++};
++
++static void ubus_cb(struct uloop_fd *sock, unsigned int events);
++static void jail_cb(struct uloop_fd *sock, unsigned int events);
++static bool msg_rx_cleanup(struct ubus_forward_fd_ctx *from);
++
++static void ubus_forward_ctx_fd_init(struct ubus_forward_fd_ctx *ctx, int fd, uloop_fd_handler cb)
++{
++	blob_buf_init(&ctx->msg_data, 0);
++	ctx->msg_fd = -1;
++	ctx->fd.fd = fd;
++	ctx->fd.cb = cb;
++	uloop_fd_add(&ctx->fd, ULOOP_READ | ULOOP_ERROR_CB);
++}
++
++static void ubus_forward_ctx_fd_free(struct ubus_forward_fd_ctx *ctx)
++{
++	uloop_fd_delete(&ctx->fd);
++	close(ctx->fd.fd);
++	msg_rx_cleanup(ctx);
++	blob_buf_free(&ctx->msg_data);
++}
++
++static struct ubus_forward_ctx *ubus_forward_ctx_new(int ubus_fd, int jail_fd, struct ubus_relay_server *relay)
++{
++	struct ubus_forward_ctx *ctx = calloc(1, sizeof(struct ubus_forward_ctx));
++
++	ubus_forward_ctx_fd_init(&ctx->ubus, ubus_fd, ubus_cb);
++	ubus_forward_ctx_fd_init(&ctx->jail, jail_fd, jail_cb);
++	ctx->relay = relay;
++	return ctx;
++}
++
++static void ubus_forward_ctx_free(struct ubus_forward_ctx *ctx)
++{
++	ubus_forward_ctx_fd_free(&ctx->jail);
++	ubus_forward_ctx_fd_free(&ctx->ubus);
++	free(ctx);
++}
++
++static void add_iov(struct iovec **i, int *offset, void *_base, size_t len)
++{
++	uint8_t *base = (uint8_t *)_base;
++	if (*offset >= len) {
++		*offset -= len;
++		return;
++	}
++
++	len -= *offset;
++	*offset = 0;
++
++	(*i)->iov_base = base + *offset;
++	(*i)->iov_len = len - *offset;
++	(*i)++;
++}
++
++static bool msg_rx_header(struct ubus_forward_fd_ctx *from)
++{
++	// Note: The buffer must contain the same alignment as what struct cmsghdr
++	// requires. Wrapping this in a union guarantees this. See "man cmsg".
++	union {
++		struct cmsghdr align;
++		uint8_t buf[CMSG_SPACE(sizeof(int))];
++	} u = {0};
++	struct msghdr msghdr = { 0 };
++	struct iovec iov[2] = {};
++	int rc;
++
++	struct iovec *i = iov;
++	int offset = from->rx_offset;
++
++	if(from->rx_offset >= sizeof(struct ubus_msghdr) + sizeof(struct blob_attr)) {
++		return true;
++	}
++
++	// On the first byte of the incoming message, accept a file descriptor (if
++	// sent) by the ubus daemon.
++	if(from->rx_offset == 0) {
++		blob_buf_init(&from->msg_data, 0);
++		msghdr.msg_control = u.buf;
++		msghdr.msg_controllen = sizeof(u.buf);
++	}
++
++	add_iov(&i, &offset, &from->msg_hdr, sizeof(struct ubus_msghdr));
++	add_iov(&i, &offset, from->msg_data.head, sizeof(struct blob_attr));
++
++	msghdr.msg_iov = iov;
++	msghdr.msg_iovlen = i - iov;
++
++	// Pass along the message, which is mainly the ubus header, verbatim
++	rc = recvmsg(from->fd.fd, &msghdr, 0);
++	if(rc < 0)
++		return false;
++
++	from->rx_offset += rc;
++
++	// Process auxiliary data. Note, depending on required padding based on
++	// the platform, multiple file descriptors `could be returned even though a
++	// well behaving ubus client only sends at most one in a given message. We
++	// need to close the extra ones potentially received to not leak file
++	// descriptors.
++	if(msghdr.msg_control) {
++		struct cmsghdr *cmsg;
++		for (cmsg = CMSG_FIRSTHDR(&msghdr);
++			cmsg != NULL;
++			cmsg = CMSG_NXTHDR(&msghdr, cmsg)
++		) {
++			if (cmsg->cmsg_type == SCM_RIGHTS && cmsg->cmsg_level == SOL_SOCKET) {
++				int *fds = (int *)CMSG_DATA(cmsg);
++				int fd_count = (cmsg->cmsg_len - sizeof(*cmsg)) / sizeof(int);
++				for(int i = 0;i<fd_count;++i) {
++					if(i == 0) {
++						from->msg_fd = fds[i];
++					} else {
++						ERROR("ujail: Detected extra FD in ubus message\n");
++						// Do not leak file descriptors from an attacker.
++						close(fds[i]);
++					}
++				}
++			}
++		}
++	}
++
++	if (from->rx_offset != sizeof(struct ubus_msghdr) + sizeof(struct blob_attr))
++		return false;
++
++	int msg_size = blob_raw_len(from->msg_data.head);
++	if(from->msg_data.buflen < msg_size) {
++		int required = msg_size - from->msg_data.buflen;
++		blob_buf_grow(&from->msg_data, required);
++	}
++
++	return true;
++}
++
++static bool msg_rx_body(struct ubus_forward_fd_ctx *from)
++{
++	if(from->rx_offset < sizeof(struct ubus_msghdr) + sizeof(struct blob_attr)) {
++		return false;
++	}
++
++	int msg_size = blob_raw_len(from->msg_data.head);
++	int offset = from->rx_offset - sizeof(struct ubus_msghdr);
++	int remaining = msg_size - offset;
++	if (remaining == 0)
++		return true;
++
++	uint8_t *data = (uint8_t *)(from->msg_data.head);
++	int rc = read(from->fd.fd, data + offset, remaining);
++	if(rc < 0)
++		return false;
++
++	from->rx_offset += rc;
++	return remaining == rc;
++}
++
++static bool msg_rx(struct ubus_forward_fd_ctx *from)
++{
++	bool rc;
++
++	rc = msg_rx_header(from);
++	if (!rc)
++		goto done;
++
++	rc = msg_rx_body(from);
++	if (!rc)
++		goto done;
++
++done:
++	return rc;
++}
++
++static bool msg_tx(struct ubus_forward_fd_ctx *from, struct ubus_forward_fd_ctx *to)
++{
++	// This code is more or less from jail_cb in ubusd_main.c
++	uint8_t fd_buf[CMSG_SPACE(sizeof(int))] = {0};
++	struct msghdr msghdr = { 0 };
++	struct iovec iov[2] = {};
++	struct cmsghdr *cmsg;
++	int rc;
++
++	struct iovec *i = iov;
++	int offset = from->tx_offset;
++
++	add_iov(&i, &offset, &from->msg_hdr, sizeof(from->msg_hdr));
++	add_iov(&i, &offset, from->msg_data.head, from->rx_offset - sizeof(from->msg_hdr));
++	if (i == iov)
++		return true;
++
++	msghdr.msg_iov = iov;
++	msghdr.msg_iovlen = i - iov;
++
++	if(from->msg_fd >= 0 && from->tx_offset == 0) {
++		msghdr.msg_control = fd_buf;
++		msghdr.msg_controllen = sizeof(fd_buf);
++
++		cmsg = CMSG_FIRSTHDR(&msghdr);
++		cmsg->cmsg_type = SCM_RIGHTS;
++		cmsg->cmsg_level = SOL_SOCKET;
++		cmsg->cmsg_len = CMSG_LEN(sizeof(int));
++		*(int *) CMSG_DATA(cmsg) = from->msg_fd;
++	}
++
++	rc = sendmsg(to->fd.fd, &msghdr, 0);
++	if (rc < 0)
++		return false;
++
++	from->tx_offset += rc;
++
++	return from->tx_offset == from->rx_offset;
++}
++
++static void usock_relay(
++	struct ubus_forward_ctx *client,
++	struct ubus_forward_fd_ctx *from,
++	struct ubus_forward_fd_ctx *to,
++	unsigned int events)
++{
++	if (from->fd.error) {
++		ubus_forward_ctx_free(client);
++		return;
++	}
++
++	if ((events & ULOOP_READ) && msg_rx(from)) {
++		// Attempt an early transmit here in case there's room.  If not,
++		// we'll block off watching for more incoming data, and
++		// start watching for our output pipe to be ready.
++		if(msg_tx(from, to)) {
++			msg_rx_cleanup(from);
++		} else {
++			// If we couldn't finish writing, monitor for being able to
++			// transmit our message instead. (This only allows one message
++			// in flight through the relay for a given direction.)
++			from->fd.flags &= ~ULOOP_READ;
++			to->fd.flags |= ULOOP_WRITE;
++			uloop_fd_add(&from->fd, from->fd.flags);
++			uloop_fd_add(&to->fd, to->fd.flags);
++		}
++	}
++
++	// Note: from/to are flipped from the ULOOP_READ case - the buffer comes from
++	//       the person who originally had ULOOP_READ set.
++	if ((events & ULOOP_WRITE) && msg_tx(to, from)) {
++		msg_rx_cleanup(to);
++
++		// Re-enable watching for READs
++		to->fd.flags |= ULOOP_READ;
++		from->fd.flags &= ~ULOOP_WRITE;
++		uloop_fd_add(&from->fd, from->fd.flags);
++		uloop_fd_add(&to->fd, to->fd.flags);
++	}
++}
++
++static bool msg_rx_cleanup(struct ubus_forward_fd_ctx *from)
++{
++	if(from->msg_fd >= 0) {
++		close(from->msg_fd);
++		from->msg_fd = -1;
++	}
++	from->rx_offset = 0;
++	from->tx_offset = 0;
++	return true;
++}
++
++static void jail_cb(struct uloop_fd *sock, unsigned int events)
++{
++	struct ubus_forward_fd_ctx *ctx_fd = container_of(sock, struct ubus_forward_fd_ctx, fd);
++	struct ubus_forward_ctx *ctx = container_of(ctx_fd, struct ubus_forward_ctx, jail);
++	usock_relay(ctx, &ctx->jail, &ctx->ubus, events);
++}
++
++static void ubus_cb(struct uloop_fd *sock, unsigned int events)
++{
++	struct ubus_forward_fd_ctx *ctx_fd = container_of(sock, struct ubus_forward_fd_ctx, fd);
++	struct ubus_forward_ctx *ctx = container_of(ctx_fd, struct ubus_forward_ctx, ubus);
++
++	usock_relay(ctx, &ctx->ubus, &ctx->jail, events);
++}
++
++static void ubus_relay_server_cb(struct uloop_fd *fd, unsigned int events)
++{
++	struct ubus_relay_server *server = container_of(fd, struct ubus_relay_server, fd);
++	struct ubus_forward_ctx *ctx;
++	int jail_fd, ubus_fd;
++	struct ucred cred;
++
++	jail_fd = accept(fd->fd, NULL, 0);
++	if (jail_fd < 0) {
++		return;
++	}
++
++	// Fetch peer PID/UID/GIO in order to pass it along
++	unsigned int cred_len = sizeof(struct ucred);
++	if (getsockopt(jail_fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) == -1) {
++		close(jail_fd);
++		return;
++	}
++
++	ubus_fd = usock(USOCK_UNIX, UBUS_UNIX_SOCKET, NULL);
++	if (ubus_fd < 0) {
++		close(jail_fd);
++		return;
++	}
++
++	ctx = ubus_forward_ctx_new(ubus_fd, jail_fd, server);
++	if (!ctx) {
++		close(jail_fd);
++		close(ubus_fd);
++		return;
++	}
++
++	return;
++}
++
++bool ubus_create_relay(pid_t pid)
++{
++	struct ubus_relay_server *server;
++	char to[PATH_MAX];
++
++	snprintf(to, sizeof(to), "/proc/%i/root/%s", pid, UBUS_UNIX_SOCKET);
++
++	// Sanity check that the path isn't created yet in case the user
++	// mounted the regular ubus socket in our filesystem.
++	if (access(to, F_OK) == 0)
++	{
++		ERROR("\"%s\" exists already in container\n", UBUS_UNIX_SOCKET);
++		return false;
++	}
++
++	mkdir_p(to, 0555);
++	rmdir(to);
++
++	umask(0111);
++
++	server = calloc(1, sizeof(struct ubus_relay_server));
++	server->fd.cb = ubus_relay_server_cb;
++	server->fd.fd = usock(USOCK_UNIX | USOCK_SERVER | USOCK_NONBLOCK, to, NULL);
++	if(server->fd.fd < 0) {
++		ERROR("Unable to create ubus socket; errno=%i\n", errno);
++		free(server);
++		return false;
++	}
++
++	if (uloop_fd_add(&server->fd, ULOOP_READ) < 0) {
++		ERROR("uloop_fd_add failed for ubus socket\n");
++		free(server);
++		return false;
++	}
++
++	return true;
++}
+diff --git a/jail/ubus.h b/jail/ubus.h
+new file mode 100644
+index 0000000..07c4ecd
+--- /dev/null
++++ b/jail/ubus.h
+@@ -0,0 +1,21 @@
++/*
++ * Copyright (C) 2026 Tim Nordell <tnordell@airgain.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License version 2.1
++ * as published by the Free Software Foundation
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++#ifndef _JAIL_UBUS_H
++#define _JAIL_UBUS_H
++
++#include <sys/types.h>
++
++struct ubus_context;
++bool ubus_create_relay(pid_t pid);
++
++#endif
+diff --git a/service/instance.c b/service/instance.c
+index bb4ded7..e46c136 100644
+--- a/service/instance.c
++++ b/service/instance.c
+@@ -110,6 +110,7 @@ enum {
+ 	JAIL_ATTR_PROCFS,
+ 	JAIL_ATTR_SYSFS,
+ 	JAIL_ATTR_UBUS,
++	JAIL_ATTR_UBUS_RPC,
+ 	JAIL_ATTR_LOG,
+ 	JAIL_ATTR_RONLY,
+ 	JAIL_ATTR_MOUNT,
+@@ -130,6 +131,7 @@ static const struct blobmsg_policy jail_attr[__JAIL_ATTR_MAX] = {
+ 	[JAIL_ATTR_PROCFS] = { "procfs", BLOBMSG_TYPE_BOOL },
+ 	[JAIL_ATTR_SYSFS] = { "sysfs", BLOBMSG_TYPE_BOOL },
+ 	[JAIL_ATTR_UBUS] = { "ubus", BLOBMSG_TYPE_BOOL },
++	[JAIL_ATTR_UBUS_RPC] = { "ubus_rpc", BLOBMSG_TYPE_BOOL },
+ 	[JAIL_ATTR_LOG] = { "log", BLOBMSG_TYPE_BOOL },
+ 	[JAIL_ATTR_RONLY] = { "ronly", BLOBMSG_TYPE_BOOL },
+ 	[JAIL_ATTR_MOUNT] = { "mount", BLOBMSG_TYPE_TABLE },
+@@ -343,6 +345,9 @@ jail_run(struct service_instance *in, char **argv)
+ 	if (jail->ubus)
+ 		argv[argc++] = "-u";
+ 
++	if (jail->ubus_rpc)
++		argv[argc++] = "-Z";
++
+ 	if (jail->log)
+ 		argv[argc++] = "-l";
+ 
+@@ -1186,6 +1191,10 @@ instance_jail_parse(struct service_instance *in, struct blob_attr *attr)
+ 		jail->ubus = true;
+ 		jail->argc++;
+ 	}
++	if (tb[JAIL_ATTR_UBUS_RPC] && blobmsg_get_bool(tb[JAIL_ATTR_UBUS_RPC])) {
++		jail->ubus_rpc = true;
++		jail->argc++;
++	}
+ 	if (tb[JAIL_ATTR_LOG] && blobmsg_get_bool(tb[JAIL_ATTR_LOG])) {
+ 		jail->log = true;
+ 		jail->argc++;
+diff --git a/service/instance.h b/service/instance.h
+index 15eb997..f362c06 100644
+--- a/service/instance.h
++++ b/service/instance.h
+@@ -27,6 +27,7 @@ struct jail {
+ 	bool procfs;
+ 	bool sysfs;
+ 	bool ubus;
++	bool ubus_rpc;
+ 	bool log;
+ 	bool ronly;
+ 	bool netns;
+-- 
+2.53.0
+

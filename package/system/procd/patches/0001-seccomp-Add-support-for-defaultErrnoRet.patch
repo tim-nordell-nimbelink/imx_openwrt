@@ -1,0 +1,52 @@
+From 2e637750f87ac2b413e1bebaacce9f475f53a7d2 Mon Sep 17 00:00:00 2001
+From: Tim Nordell <tnordell@airgain.com>
+Date: Wed, 11 Mar 2026 22:18:09 -0500
+Subject: [PATCH 1/7] seccomp: Add support for defaultErrnoRet
+
+This was added in the official specification [1] for the OCI seccomp
+description in March of 2021. The default in the spec previously was EPERM
+but it wasn't honored in ujail.
+
+[1] https://github.com/opencontainers/runtime-spec/pull/1087/changes
+---
+ jail/seccomp-oci.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/jail/seccomp-oci.c b/jail/seccomp-oci.c
+index f089ac6..f1f8068 100644
+--- a/jail/seccomp-oci.c
++++ b/jail/seccomp-oci.c
+@@ -153,6 +153,7 @@ static uint32_t resolve_architecture(char *archname)
+ 
+ enum {
+ 	OCI_LINUX_SECCOMP_DEFAULTACTION,
++	OCI_LINUX_SECCOMP_DEFAULTERRNO,
+ 	OCI_LINUX_SECCOMP_ARCHITECTURES,
+ 	OCI_LINUX_SECCOMP_FLAGS,
+ 	OCI_LINUX_SECCOMP_SYSCALLS,
+@@ -161,6 +162,7 @@ enum {
+ 
+ static const struct blobmsg_policy oci_linux_seccomp_policy[] = {
+ 	[OCI_LINUX_SECCOMP_DEFAULTACTION] = { "defaultAction", BLOBMSG_TYPE_STRING },
++	[OCI_LINUX_SECCOMP_DEFAULTERRNO] = { "defaultErrnoRet", BLOBMSG_TYPE_INT32 },
+ 	[OCI_LINUX_SECCOMP_ARCHITECTURES] = { "architectures", BLOBMSG_TYPE_ARRAY },
+ 	[OCI_LINUX_SECCOMP_FLAGS] = { "flags", BLOBMSG_TYPE_ARRAY },
+ 	[OCI_LINUX_SECCOMP_SYSCALLS] = { "syscalls", BLOBMSG_TYPE_ARRAY },
+@@ -220,6 +222,14 @@ struct sock_fprog *parseOCIlinuxseccomp(struct blob_attr *msg)
+ 	}
+ 
+ 	default_policy = resolve_action(blobmsg_get_string(tb[OCI_LINUX_SECCOMP_DEFAULTACTION]));
++	if (tb[OCI_LINUX_SECCOMP_DEFAULTERRNO]) {
++		if (default_policy != SECCOMP_RET_ERRNO)
++			return NULL;
++
++		default_policy = SECCOMP_RET_ERROR(blobmsg_get_u32(
++				tb[OCI_LINUX_SECCOMP_DEFAULTERRNO]));
++	} else if (default_policy == SECCOMP_RET_ERRNO)
++		default_policy = SECCOMP_RET_ERROR(EPERM);
+ 
+ 	/* verify architecture while ignoring the x86_64 anomaly for now */
+ 	if (tb[OCI_LINUX_SECCOMP_ARCHITECTURES]) {
+-- 
+2.53.0
+

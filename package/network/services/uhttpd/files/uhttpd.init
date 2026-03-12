@@ -216,6 +216,19 @@ start_instance()
 		[ -s "$file" ] && procd_append_param command -H "$file"
 	done
 
+	procd_set_param no_new_privs 1
+	procd_set_param seccomp /etc/seccomp/uhttpd.json
+	procd_set_param capabilities /etc/capabilities/uhttpd.json
+	procd_add_jail uhttpd ubus_rpc ronly
+	procd_add_jail_mount /bin
+	procd_add_jail_mount /sbin
+	procd_add_jail_mount /etc
+	procd_add_jail_mount /lib
+	procd_add_jail_mount /usr
+	procd_add_jail_mount /www
+	procd_add_jail_mount /var/run/dbus
+	procd_add_jail_mount /mnt/log
+
 	procd_close_instance
 }
 
